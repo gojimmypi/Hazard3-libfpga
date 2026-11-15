@@ -27,6 +27,7 @@ module ahb_sync_sram #(
 	parameter W_ADDR = 32,
 	parameter DEPTH = 1 << 11,
 	parameter HAS_WRITE_BUFFER = 1,
+	parameter DUAL_PORT_RW = 0,
 	parameter PRELOAD_FILE = ""
 ) (
 	// Globals
@@ -54,6 +55,96 @@ parameter  W_SRAM_ADDR = $clog2(DEPTH);
 localparam W_BYTES     = W_DATA / 8;
 parameter  W_BYTEADDR  = $clog2(W_BYTES);
 
+
+// Optional timing experiment. With separate RAM read and write addresses,
+// a read address phase can proceed during the previous write data phase.
+// This removes the current read address/HTRANS from the RAM write-enable path.
+// The read-after-write bypass merges byte lanes for a same-word collision.
+// Both ports are synchronous and infer an ECP5 block RAM when supported.
+// Leave DUAL_PORT_RW=0 to preserve the original adapter exactly.
+
+generate
+if (DUAL_PORT_RW) begin: separate_read_write_ports
+
+    wire [W_SRAM_ADDR-1:0] read_row = ahbls_haddr[W_BYTEADDR +: W_SRAM_ADDR];
+    wire read_aphase = ahbls_htrans[1] && ahbls_hready && !ahbls_hwrite;
+    wire write_aphase = ahbls_htrans[1] && ahbls_hready && ahbls_hwrite;
+    wire [W_BYTES-1:0] mask_unshifted =
+        ~({W_BYTES{1'b1}} << (1 << ahbls_hsize));
+    wire [W_BYTES-1:0] write_mask =
+        mask_unshifted << ahbls_haddr[W_BYTEADDR-1:0];
+
+    reg [W_SRAM_ADDR-1:0] pending_write_row;
+    reg [W_BYTES-1:0] pending_write_mask;
+    reg [W_BYTES-1:0] bypass_mask;
+    reg [W_DATA-1:0] bypass_data;
+    reg [W_DATA-1:0] read_data;
+
+    // One outstanding AHB write data phase. Its data appears on HWDATA
+    // in the cycle following its accepted write address phase.
+    // A separate RAM write port lets us retire it even if the next
+    // address phase is a read, without a combinational read->write path.
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            pending_write_row <= {W_SRAM_ADDR{1'b0}};
+            pending_write_mask <= {W_BYTES{1'b0}};
+            bypass_mask <= {W_BYTES{1'b0}};
+            bypass_data <= {W_DATA{1'b0}};
+        end else begin
+            if (ahbls_hready) begin
+                pending_write_mask <= write_aphase ? write_mask : {W_BYTES{1'b0}};
+                if (write_aphase)
+                    pending_write_row <= read_row;
+                // Capture the data and byte enables from a simultaneous
+                // write to the word being read. The raw memory read can
+                // return pre-write bytes, depending on the EBR mode.
+                bypass_mask <= (read_aphase && pending_write_row == read_row)
+                    ? pending_write_mask : {W_BYTES{1'b0}};
+                if (read_aphase)
+                    bypass_data <= ahbls_hwdata;
+            end else begin
+                // A write can retire once while the shared bus is stalled.
+                // Do not replay it on subsequent stalled cycles.
+                pending_write_mask <= {W_BYTES{1'b0}};
+            end
+        end
+    end
+
+    reg [W_DATA-1:0] ram [0:DEPTH-1];
+    // Keep cold-boot monitor and SIM initialization identical to sram_sync.
+`ifdef SIM
+    initial begin: sim_init
+        integer index;
+        for (index = 0; index < DEPTH; index = index + 1)
+            ram[index] = {W_DATA{1'b0}};
+        if (PRELOAD_FILE != "")
+            $readmemh(PRELOAD_FILE, ram);
+    end
+`else
+    if (PRELOAD_FILE != "") begin: init_from_file
+        initial $readmemh(PRELOAD_FILE, ram);
+    end
+`endif
+
+    genvar lane;
+    for (lane = 0; lane < W_BYTES; lane = lane + 1) begin: byte_lane
+        // Simple dual-port synchronous RAM, with byte enables on the
+        // independent write port. The read register updates only for
+        // accepted AHB read addresses.
+        always @(posedge clk) begin
+            if (pending_write_mask[lane])
+                ram[pending_write_row][lane*8 +: 8] <= ahbls_hwdata[lane*8 +: 8];
+            if (read_aphase)
+                read_data[lane*8 +: 8] <= ram[read_row][lane*8 +: 8];
+        end
+        assign ahbls_hrdata[lane*8 +: 8] = bypass_mask[lane] ?
+            bypass_data[lane*8 +: 8] : read_data[lane*8 +: 8];
+    end
+
+    assign ahbls_hready_resp = 1'b1;
+    assign ahbls_hresp = 1'b0;
+
+end else begin: legacy_single_port
 
 // ----------------------------------------------------------------------------
 // AHBL state machine and buffering
@@ -158,12 +249,12 @@ always @ (posedge clk or negedge rst_n)
 
 wire addr_match = HAS_WRITE_BUFFER && haddr_dphase == addr_saved;
 genvar b;
-generate
 for (b = 0; b < W_BYTES; b = b + 1) begin: write_merge
 	assign ahbls_hrdata[b * 8 +: 8] = addr_match && wbuf_vld && wmask_saved[b] ?
 		wdata_saved[b * 8 +: 8] : sram_rdata[b * 8 +: 8];
 end
-endgenerate
 
+end
+endgenerate
 
 endmodule
